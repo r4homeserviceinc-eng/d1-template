@@ -1,16 +1,15 @@
+```ts
 // src/index.ts
-// =====================================================
-// R4 Stripe Worker (DEBUG BUILD)
+// ============================================
+// R4 Stripe Worker (Test Mode / Production-ready structure)
 // Endpoints:
-//   POST /api/create-checkout-session   -> returns { url, sessionId, debug, stripeMetadataEcho }
-//   POST /api/stripe-webhook           -> logs webhook body (no signature verify yet)
+//   POST /api/create-checkout-session
+//   POST /api/stripe-webhook
 //
-// REQUIRED Worker Secrets (Cloudflare -> Settings -> Variables -> Secrets):
-//   STRIPE_SECRET_KEY      = sk_test_...
-//   STRIPE_WEBHOOK_SECRET  = whsec_...   (not used yet in this debug build)
-//
-// After we confirm metadata shows up in Stripe, I’ll give you the “production clean” version.
-// =====================================================
+// Required Cloudflare Worker Secrets:
+//   STRIPE_SECRET_KEY        = sk_test_...
+//   STRIPE_WEBHOOK_SECRET    = whsec_...
+// ============================================
 
 export interface Env {
   STRIPE_SECRET_KEY: string;
@@ -21,11 +20,15 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // ---- CORS preflight ----
+    // ---- CORS ----
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders(request) });
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders(request),
+      });
     }
 
+    // ---- ROUTES ----
     if (url.pathname === "/api/create-checkout-session") {
       return handleCreateCheckoutSession(request, env);
     }
@@ -38,17 +41,15 @@ export default {
   },
 };
 
-// =====================================================
-// CREATE CHECKOUT SESSION (Subscription / Monthly)
-// =====================================================
+// =======================================================
+// CREATE CHECKOUT SESSION (Subscription / Monthly billing)
+// =======================================================
 async function handleCreateCheckoutSession(
   request: Request,
   env: Env
 ): Promise<Response> {
-  if (request.method !== "POST") return json({ error: "Method not allowed" }, 405, request);
-
-  if (!env.STRIPE_SECRET_KEY) {
-    return json({ error: "Missing STRIPE_SECRET_KEY secret in Cloudflare Worker" }, 500, request);
+  if (request.method !== "POST") {
+    return json({ error: "Method not allowed" }, 405, request);
   }
 
   let body: any;
@@ -58,33 +59,37 @@ async function handleCreateCheckoutSession(
     return json({ error: "Invalid JSON" }, 400, request);
   }
 
-  const partNumber = String(body?.partNumber ?? "").trim();
-  const serviceSummary = String(body?.serviceSummary ?? "");
-  const customerEmail = String(body?.customerEmail ?? "").trim();
+  const partNumber = String(body?.partNumber || "").trim();
+  const monthlyAmountRaw = body?.monthlyAmount;
+  const serviceSummary = String(body?.serviceSummary || "");
+  const customerEmail = String(body?.customerEmail || "").trim();
 
-  const monthlyAmountNum = Number(body?.monthlyAmount);
-  const amountCents = Math.round(monthlyAmountNum * 100);
+  if (!partNumber) {
+    return json({ error: "Missing partNumber" }, 400, request);
+  }
 
-  if (!partNumber) return json({ error: "Missing partNumber" }, 400, request);
-  if (!Number.isFinite(monthlyAmountNum) || amountCents <= 0) {
+  const monthlyAmount = Number(monthlyAmountRaw);
+  const amountCents = Math.round(monthlyAmount * 100);
+
+  if (!Number.isFinite(monthlyAmount) || amountCents <= 0) {
     return json({ error: "monthlyAmount must be a positive number" }, 400, request);
   }
 
-  // DEBUG: show exactly what the Worker received
-  console.log("CREATE CHECKOUT PAYLOAD:", {
-    partNumber,
-    serviceSummary,
-    monthlyAmount: monthlyAmountNum,
-    amountCents,
-    customerEmail: customerEmail || "(none)",
-  });
+  if (!env.STRIPE_SECRET_KEY) {
+    return json({ error: "Missing STRIPE_SECRET_KEY in Worker secrets" }, 500, request);
+  }
 
-  const params: Record<string, string> = {
+  // Build Stripe Checkout Session (server-side)
+  // Using dynamic price_data so you do NOT need products/prices for each plan.
+  const params = new URLSearchParams({
     mode: "subscription",
-    success_url: "https://r4homeservice.com/stripe-success?session_id={CHECKOUT_SESSION_ID}",
+    success_url:
+      "https://r4homeservice.com/stripe-success?session_id={CHECKOUT_SESSION_ID}",
     cancel_url: "https://r4homeservice.com/stripe-cancel",
 
-    // line item
+    ...(customerEmail ? { customer_email: customerEmail } : {}),
+
+    // Line item (recurring monthly)
     "line_items[0][quantity]": "1",
     "line_items[0][price_data][currency]": "usd",
     "line_items[0][price_data][recurring][interval]": "month",
@@ -98,19 +103,15 @@ async function handleCreateCheckoutSession(
     // -------------------------
     "metadata[partNumber]": partNumber,
     "metadata[serviceSummary]": serviceSummary,
-    "metadata[monthlyAmount]": monthlyAmountNum.toFixed(2),
+    "metadata[monthlyAmount]": monthlyAmount.toFixed(2),
 
     // -------------------------
-    // SUBSCRIPTION METADATA  ✅
+    // SUBSCRIPTION METADATA ✅ (so you can see it on the subscription record)
     // -------------------------
     "subscription_data[metadata][partNumber]": partNumber,
     "subscription_data[metadata][serviceSummary]": serviceSummary,
-    "subscription_data[metadata][monthlyAmount]": monthlyAmountNum.toFixed(2),
-  };
-
-  if (customerEmail) {
-    params["customer_email"] = customerEmail;
-  }
+    "subscription_data[metadata][monthlyAmount]": monthlyAmount.toFixed(2),
+  });
 
   const stripeRes = await fetch("https://api.stripe.com/v1/checkout/sessions", {
     method: "POST",
@@ -118,14 +119,10 @@ async function handleCreateCheckoutSession(
       Authorization: `Bearer ${env.STRIPE_SECRET_KEY}`,
       "Content-Type": "application/x-www-form-urlencoded",
     },
-    body: new URLSearchParams(params),
+    body: params,
   });
 
-  const stripeJson: any = await stripeRes.json().catch(() => null);
-
-  // DEBUG: log Stripe response
-  console.log("STRIPE RESPONSE STATUS:", stripeRes.status);
-  console.log("STRIPE RESPONSE (first 2000 chars):", JSON.stringify(stripeJson || {}).slice(0, 2000));
+  const stripeJson = await stripeRes.json().catch(() => null);
 
   if (!stripeRes.ok) {
     return json(
@@ -139,49 +136,34 @@ async function handleCreateCheckoutSession(
   }
 
   if (!stripeJson?.url) {
-    return json(
-      { error: "Stripe did not return a checkout url", details: stripeJson },
-      400,
-      request
-    );
+    return json({ error: "Stripe did not return a checkout url", details: stripeJson }, 400, request);
   }
 
-  // DEBUG RESPONSE: return what we sent + what Stripe echoed back
-  return json(
-    {
-      url: stripeJson.url,
-      sessionId: stripeJson.id,
-      debug: {
-        partNumber,
-        serviceSummary,
-        monthlyAmount: monthlyAmountNum.toFixed(2),
-        amountCents,
-      },
-      stripeMetadataEcho: stripeJson.metadata ?? null,
-    },
-    200,
-    request
-  );
+  return json({ url: stripeJson.url }, 200, request);
 }
 
-// =====================================================
-// WEBHOOK (debug logging only for now)
-// =====================================================
+// =======================================================
+// STRIPE WEBHOOK (minimal: logs + returns 200)
+// NOTE: We'll harden this with signature verification next.
+// =======================================================
 async function handleStripeWebhook(request: Request, env: Env): Promise<Response> {
-  if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", { status: 405 });
+  }
 
-  const sig = request.headers.get("Stripe-Signature") || "";
+  // Raw body is required for signature verification. Keep as text.
   const rawBody = await request.text();
+  const sig = request.headers.get("Stripe-Signature") || "";
 
-  console.log("WEBHOOK RECEIVED:");
+  // For now: log. (Next step we will implement full signature verification.)
+  console.log("Stripe webhook received");
   console.log("Stripe-Signature:", sig);
   console.log("Body (first 2000 chars):", rawBody.slice(0, 2000));
 
-  // NOTE: We'll add signature verification next once metadata is confirmed.
   return new Response("ok", { status: 200 });
 }
 
-// ---------------- Utilities ----------------
+// ----------------- utilities -----------------
 function corsHeaders(request: Request) {
   const origin = request.headers.get("Origin") || "*";
   return {
@@ -201,3 +183,4 @@ function json(obj: unknown, status: number, request: Request) {
     },
   });
 }
+```
