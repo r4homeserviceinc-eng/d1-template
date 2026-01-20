@@ -1,6 +1,6 @@
 // src/index.ts
 // =====================================================
-// R4 Stripe Worker + GoHighLevel Upsert Sync (CLEAN)
+// R4 Stripe Worker + GoHighLevel Upsert Sync (ROBUST + BETTER LOGS)
 //
 // Endpoints:
 //   POST /api/create-checkout-session
@@ -32,8 +32,8 @@ export interface Env {
   STRIPE_SECRET_KEY: string;
   STRIPE_WEBHOOK_SECRET: string;
 
-  GHL_PRIVATE_TOKEN: string;
-  GHL_LOCATION_ID: string;
+  GHL_PRIVATE_TOKEN?: string;
+  GHL_LOCATION_ID?: string;
 }
 
 export default {
@@ -96,12 +96,12 @@ async function handleCreateCheckoutSession(request: Request, env: Env): Promise<
     "line_items[0][price_data][product_data][description]":
       "Custom home service membership based on your selected services.",
 
-    // SESSION metadata (easy to view in checkout session)
+    // SESSION metadata
     "metadata[partNumber]": partNumber,
     "metadata[serviceSummary]": serviceSummary,
     "metadata[monthlyAmount]": monthlyAmountNum.toFixed(2),
 
-    // SUBSCRIPTION metadata (best place for lifecycle)
+    // SUBSCRIPTION metadata
     "subscription_data[metadata][partNumber]": partNumber,
     "subscription_data[metadata][serviceSummary]": serviceSummary,
     "subscription_data[metadata][monthlyAmount]": monthlyAmountNum.toFixed(2),
@@ -140,7 +140,7 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
   const sig = request.headers.get("Stripe-Signature");
   if (!sig) return new Response("Missing Stripe-Signature", { status: 400 });
 
-  // Read raw bytes (best practice for signature verification)
+  // Read raw bytes for reliable signature verification
   const rawBuf = await request.arrayBuffer();
   const rawBody = new TextDecoder("utf-8").decode(rawBuf);
 
@@ -157,25 +157,49 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
   const type = String(event?.type || "");
   const obj = event?.data?.object;
 
+  // Helpful log so you can see what is firing
+  console.log("Stripe event:", type);
+
   // -----------------------------
   // checkout.session.completed
   // -----------------------------
   if (type === "checkout.session.completed") {
     const session = obj;
 
-    const email = String(session?.customer_details?.email || "");
-    const phone = String(session?.customer_details?.phone || "");
-    const name = String(session?.customer_details?.name || "");
-
     const customerId = session?.customer ? String(session.customer) : "";
     const subscriptionId = session?.subscription ? String(session.subscription) : "";
 
+    // Robust metadata retrieval
     const md = session?.metadata || {};
     const partNumber = String(md.partNumber || "");
     const serviceSummary = String(md.serviceSummary || "");
     const monthlyAmount = String(md.monthlyAmount || "");
 
-    // Update Stripe Customer metadata (optional but helpful)
+    // Robust email/phone/name retrieval
+    let email = String(
+      session?.customer_details?.email ||
+        session?.customer_email ||
+        session?.customer_details?.email_address ||
+        ""
+    ).trim();
+
+    let phone = String(session?.customer_details?.phone || "").trim();
+    let name = String(session?.customer_details?.name || "").trim();
+
+    // If email is still missing, fetch from Stripe Customer record
+    if (!email && customerId) {
+      const cust = await stripeGetCustomer(env.STRIPE_SECRET_KEY, customerId);
+      email = String(cust?.email || "").trim();
+      if (!phone) phone = String(cust?.phone || "").trim();
+      if (!name) name = String(cust?.name || "").trim();
+      console.log("Fetched missing contact info from Stripe Customer:", {
+        email: email || "(none)",
+        phone: phone || "(none)",
+        name: name || "(none)",
+      });
+    }
+
+    // Update Stripe Customer metadata
     if (customerId) {
       await stripeUpdateCustomerMetadata(env.STRIPE_SECRET_KEY, customerId, {
         partNumber,
@@ -188,21 +212,25 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
       });
     }
 
-    // Upsert contact in GoHighLevel
-    await ghlUpsertContact(env, {
-      email,
-      phone,
-      name,
-      tags: ["R4-Subscriber"],
-      custom: {
-        r4_part_number: partNumber,
-        r4_service_summary: serviceSummary,
-        r4_monthly_amount: monthlyAmount,
-        stripe_customer_id: customerId,
-        stripe_subscription_id: subscriptionId,
-        stripe_subscription_status: "active",
-      },
-    });
+    // Upsert contact in GoHighLevel (requires email or phone)
+    if (!email && !phone) {
+      console.log("Skipping GHL upsert: no email/phone available from Stripe session/customer.");
+    } else {
+      await ghlUpsertContact(env, {
+        email,
+        phone,
+        name,
+        tags: ["R4-Subscriber"],
+        custom: {
+          r4_part_number: partNumber,
+          r4_service_summary: serviceSummary,
+          r4_monthly_amount: monthlyAmount,
+          stripe_customer_id: customerId,
+          stripe_subscription_id: subscriptionId,
+          stripe_subscription_status: "active",
+        },
+      });
+    }
   }
 
   // -----------------------------
@@ -223,7 +251,6 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
         ? new Date(Number(invoice.status_transitions.paid_at) * 1000).toISOString()
         : new Date().toISOString();
 
-    // Stripe customer metadata
     if (customerId) {
       await stripeUpdateCustomerMetadata(env.STRIPE_SECRET_KEY, customerId, {
         lastInvoiceId: invoiceId,
@@ -233,19 +260,9 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
       });
     }
 
-    // GHL upsert (no email/phone guaranteed on invoice events)
-    await ghlUpsertContact(env, {
-      email: "",
-      phone: "",
-      name: "",
-      tags: ["R4-Subscriber"],
-      custom: {
-        stripe_subscription_id: subscriptionId,
-        stripe_last_invoice_id: invoiceId,
-        stripe_last_invoice_paid_at: paidAt,
-        stripe_last_invoice_amount: amountPaid,
-      },
-    });
+    // If you want invoice data in GHL, we need a lookup strategy by Stripe customer id.
+    // For now, we only log (to avoid creating new contacts with no email/phone).
+    console.log("Invoice paid:", { invoiceId, amountPaid, subscriptionId, customerId });
   }
 
   // -----------------------------
@@ -271,18 +288,10 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
       });
     }
 
-    await ghlUpsertContact(env, {
-      email: "",
-      phone: "",
-      name: "",
-      tags: ["R4-Subscriber"],
-      custom: {
-        stripe_customer_id: customerId,
-        stripe_subscription_status: status,
-        stripe_cancel_at_period_end: String(cancelAtPeriodEnd),
-        stripe_current_period_end: currentPeriodEnd,
-      },
-    });
+    console.log("Subscription updated:", { customerId, status, cancelAtPeriodEnd, currentPeriodEnd });
+
+    // Optional: update GHL status IF you have a way to find the contact.
+    // Best approach: store a map (Stripe customer id -> GHL contact id) in D1/KV later.
   }
 
   // -----------------------------
@@ -299,24 +308,14 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
       });
     }
 
-    await ghlUpsertContact(env, {
-      email: "",
-      phone: "",
-      name: "",
-      tags: ["R4-Subscriber"],
-      custom: {
-        stripe_customer_id: customerId,
-        stripe_subscription_status: "canceled",
-      },
-    });
+    console.log("Subscription deleted:", { customerId });
   }
 
   return new Response("ok", { status: 200 });
 }
 
 // =====================================================
-// GoHighLevel: Contacts Upsert
-// NOTE: This uses customFields: [{ key, field_value }]
+// GoHighLevel: Contacts Upsert (better error logging)
 // =====================================================
 async function ghlUpsertContact(
   env: Env,
@@ -328,9 +327,9 @@ async function ghlUpsertContact(
     custom: Record<string, string>;
   }
 ) {
-  // If you haven't added these secrets yet, fail softly (so Stripe webhooks still succeed)
+  // Fail softly so Stripe webhook still returns 200
   if (!env.GHL_PRIVATE_TOKEN || !env.GHL_LOCATION_ID) {
-    console.log("GHL not configured (missing GHL_PRIVATE_TOKEN or GHL_LOCATION_ID). Skipping upsert.");
+    console.log("GHL not configured: missing GHL_PRIVATE_TOKEN or GHL_LOCATION_ID. Skipping upsert.");
     return;
   }
 
@@ -345,10 +344,18 @@ async function ghlUpsertContact(
     source: "stripe-webhook",
   };
 
-  // Only include contact identifiers if present
   if (input.email?.trim()) payload.email = input.email.trim();
   if (input.phone?.trim()) payload.phone = input.phone.trim();
   if (input.name?.trim()) payload.name = input.name.trim();
+
+  console.log("GHL upsert payload (sanitized):", {
+    locationId: env.GHL_LOCATION_ID,
+    hasEmail: Boolean(payload.email),
+    hasPhone: Boolean(payload.phone),
+    hasName: Boolean(payload.name),
+    tags: payload.tags,
+    customFieldKeys: customFields.map((c) => c.key),
+  });
 
   const res = await fetch("https://services.leadconnectorhq.com/contacts/upsert", {
     method: "POST",
@@ -361,9 +368,29 @@ async function ghlUpsertContact(
   });
 
   if (!res.ok) {
-    const j = await res.json().catch(() => ({}));
-    console.log("GHL upsert failed:", res.status, j);
+    const text = await res.text().catch(() => "");
+    console.log("GHL upsert failed:", res.status, text);
+    return;
   }
+
+  // log success response so you can see contact id
+  const j = await res.json().catch(() => null);
+  console.log("GHL upsert success:", j);
+}
+
+// =====================================================
+// Stripe helper: Get customer (to fill missing email/phone)
+// =====================================================
+async function stripeGetCustomer(stripeSecretKey: string, customerId: string): Promise<any> {
+  const res = await fetch(`https://api.stripe.com/v1/customers/${encodeURIComponent(customerId)}`, {
+    headers: { Authorization: `Bearer ${stripeSecretKey}` },
+  });
+  const j = await res.json().catch(() => null);
+  if (!res.ok) {
+    console.log("Stripe get customer failed:", res.status, j);
+    return null;
+  }
+  return j;
 }
 
 // =====================================================
