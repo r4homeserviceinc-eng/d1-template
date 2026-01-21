@@ -1,7 +1,34 @@
 // src/index.ts
 // =====================================================
 // R4 Stripe Worker + GoHighLevel Upsert Sync (ROBUST + BETTER LOGS)
-// + Phone number collection enabled in Stripe Checkout
+// UPDATED:
+//  - Accept phone + smsOptIn from selector tool
+//  - Store phone + smsOptIn in Stripe metadata (session + subscription)
+//  - Use metadata phone if Stripe checkout doesn't provide it
+//  - Add SMS-OptIn tag + custom fields to GHL
+//
+// Endpoints:
+//   POST /api/create-checkout-session
+//   POST /api/stripe-webhook
+//
+// REQUIRED Worker Secrets:
+//   STRIPE_SECRET_KEY
+//   STRIPE_WEBHOOK_SECRET
+//
+// OPTIONAL (for GHL sync):
+//   GHL_PRIVATE_TOKEN
+//   GHL_LOCATION_ID
+//
+// In GoHighLevel, create these Contact custom fields (keys must match exactly):
+//   r4_part_number
+//   r4_service_summary
+//   r4_monthly_amount
+//   stripe_customer_id
+//   stripe_subscription_id
+//   stripe_subscription_status
+//   r4_customer_phone
+//   r4_sms_opt_in
+//   r4_sms_opt_in_ts
 // =====================================================
 
 export interface Env {
@@ -51,12 +78,25 @@ async function handleCreateCheckoutSession(request: Request, env: Env): Promise<
   const serviceSummary = String(body?.serviceSummary ?? "");
   const customerEmail = String(body?.customerEmail ?? "").trim();
 
+  // NEW: phone + sms opt-in from selector
+  // phone is expected in E.164 like +13525551234 (your selector normalizes)
+  const selectorPhone = String(body?.phone ?? "").trim();
+  const smsOptInBool = Boolean(body?.smsOptIn);
+  const smsOptIn = smsOptInBool ? "yes" : "no";
+  const smsOptInTs = new Date().toISOString();
+
   const monthlyAmountNum = Number(body?.monthlyAmount);
   const amountCents = Math.round(monthlyAmountNum * 100);
 
   if (!partNumber) return json({ error: "Missing partNumber" }, 400, request);
   if (!Number.isFinite(monthlyAmountNum) || amountCents <= 0) {
     return json({ error: "monthlyAmount must be a positive number" }, 400, request);
+  }
+
+  // Optional: require phone if you want to enforce it server-side too
+  // (selector already enforces, but this prevents direct calls without phone)
+  if (!selectorPhone) {
+    return json({ error: "Missing phone" }, 400, request);
   }
 
   const params: Record<string, string> = {
@@ -72,18 +112,30 @@ async function handleCreateCheckoutSession(request: Request, env: Env): Promise<
     "line_items[0][price_data][product_data][description]":
       "Custom home service membership based on your selected services.",
 
-    // NEW: collect phone number in Stripe Checkout
-    "phone_number_collection[enabled]": "true",
+    // NOTE:
+    // We are NOT using Stripe's phone_number_collection here because it shows
+    // the "save my info for faster checkout" Link UI.
+    // Phone is collected on the selector and stored in metadata.
 
     // SESSION metadata
     "metadata[partNumber]": partNumber,
     "metadata[serviceSummary]": serviceSummary,
     "metadata[monthlyAmount]": monthlyAmountNum.toFixed(2),
 
+    // NEW: store selector phone + sms consent on session metadata
+    "metadata[selectorPhone]": selectorPhone,
+    "metadata[smsOptIn]": smsOptIn,
+    "metadata[smsOptInTs]": smsOptInTs,
+
     // SUBSCRIPTION metadata
     "subscription_data[metadata][partNumber]": partNumber,
     "subscription_data[metadata][serviceSummary]": serviceSummary,
     "subscription_data[metadata][monthlyAmount]": monthlyAmountNum.toFixed(2),
+
+    // NEW: store selector phone + sms consent on subscription metadata too
+    "subscription_data[metadata][selectorPhone]": selectorPhone,
+    "subscription_data[metadata][smsOptIn]": smsOptIn,
+    "subscription_data[metadata][smsOptInTs]": smsOptInTs,
   };
 
   if (customerEmail) params["customer_email"] = customerEmail;
@@ -98,7 +150,10 @@ async function handleCreateCheckoutSession(request: Request, env: Env): Promise<
   });
 
   const stripeJson: any = await stripeRes.json().catch(() => null);
-  if (!stripeRes.ok) return json({ error: "Stripe error", details: stripeJson }, 400, request);
+  if (!stripeRes.ok) {
+    console.log("Stripe create session failed:", stripeRes.status, stripeJson);
+    return json({ error: "Stripe error", details: stripeJson }, 400, request);
+  }
 
   return json({ url: stripeJson.url }, 200, request);
 }
@@ -143,23 +198,33 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
     const serviceSummary = String(md.serviceSummary || "");
     const monthlyAmount = String(md.monthlyAmount || "");
 
+    // NEW: pull phone + sms consent from metadata
+    const selectorPhone = String(md.selectorPhone || "").trim();
+    const smsOptIn = String(md.smsOptIn || "").trim();       // "yes" | "no"
+    const smsOptInTs = String(md.smsOptInTs || "").trim();   // ISO string
+
     let email = String(
       session?.customer_details?.email ||
-        session?.customer_email ||
-        session?.customer_details?.email_address ||
-        ""
+      session?.customer_email ||
+      session?.customer_details?.email_address ||
+      ""
     ).trim();
 
+    // Use Stripe phone if present, else fall back to selector metadata phone
     let phone = String(session?.customer_details?.phone || "").trim();
+    if (!phone && selectorPhone) phone = selectorPhone;
+
     let name = String(session?.customer_details?.name || "").trim();
 
-    if (!email && customerId) {
+    // If missing email/name still, try Stripe customer
+    if ((!email || !name) && customerId) {
       const cust = await stripeGetCustomer(env.STRIPE_SECRET_KEY, customerId);
-      email = String(cust?.email || "").trim();
-      if (!phone) phone = String(cust?.phone || "").trim();
+      if (!email) email = String(cust?.email || "").trim();
       if (!name) name = String(cust?.name || "").trim();
+      if (!phone) phone = String(cust?.phone || "").trim(); // last resort
     }
 
+    // Update Stripe Customer metadata
     if (customerId) {
       await stripeUpdateCustomerMetadata(env.STRIPE_SECRET_KEY, customerId, {
         partNumber,
@@ -169,9 +234,19 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
         stripeSubscriptionId: subscriptionId,
         subscriptionStatus: "active",
         lastCheckoutSession: String(session?.id || ""),
+
+        // NEW
+        selectorPhone: selectorPhone || phone,
+        smsOptIn,
+        smsOptInTs,
       });
     }
 
+    // Build tags for GHL
+    const tags = ["R4-Subscriber"];
+    if (smsOptIn === "yes") tags.push("SMS-OptIn");
+
+    // Upsert contact in GoHighLevel (requires email or phone)
     if (!email && !phone) {
       console.log("Skipping GHL upsert: no email/phone available from Stripe session/customer.");
     } else {
@@ -179,7 +254,7 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
         email,
         phone,
         name,
-        tags: ["R4-Subscriber"],
+        tags,
         custom: {
           r4_part_number: partNumber,
           r4_service_summary: serviceSummary,
@@ -187,6 +262,11 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
           stripe_customer_id: customerId,
           stripe_subscription_id: subscriptionId,
           stripe_subscription_status: "active",
+
+          // NEW custom fields
+          r4_customer_phone: phone,
+          r4_sms_opt_in: smsOptIn,
+          r4_sms_opt_in_ts: smsOptInTs,
         },
       });
     }
