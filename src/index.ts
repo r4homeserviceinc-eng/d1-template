@@ -144,8 +144,13 @@ async function handleCreateCheckoutSession(request: Request, env: Env): Promise<
     body: new URLSearchParams(params),
   });
 
-  const stripeJson: any = await stripeRes.json().catch(() => null);
-  if (!stripeRes.ok) return json({ error: "Stripe error", details: stripeJson }, 400, request);
+const stripeJson: any = await stripeRes.json().catch(() => null);
+
+if (!stripeRes.ok) {
+  console.log("Stripe create session failed:", stripeRes.status, stripeJson);
+  return json({ error: "Stripe error", details: stripeJson }, 400, request);
+}
+
 
   return json({ url: stripeJson.url }, 200, request);
 }
