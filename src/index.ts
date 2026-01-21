@@ -52,6 +52,10 @@ export default {
       return handleCreateCheckoutSession(request, env);
     }
 
+    if (url.pathname === "/api/create-billing-portal") {
+  return handleCreateBillingPortal(request, env);
+}
+
     if (url.pathname === "/api/stripe-webhook") {
       return handleStripeWebhook(request, env);
     }
@@ -156,6 +160,51 @@ async function handleCreateCheckoutSession(request: Request, env: Env): Promise<
   }
 
   return json({ url: stripeJson.url }, 200, request);
+}
+async function handleCreateBillingPortal(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") return json({ error: "Method not allowed" }, 405, request);
+  if (!env.STRIPE_SECRET_KEY) return json({ error: "Missing STRIPE_SECRET_KEY" }, 500, request);
+
+  let body: any;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON" }, 400, request);
+  }
+
+  const email = String(body?.email ?? "").trim().toLowerCase();
+  if (!email) return json({ error: "Missing email" }, 400, request);
+
+  // Find Stripe customer by email
+  const listRes = await fetch(
+    "https://api.stripe.com/v1/customers?limit=1&email=" + encodeURIComponent(email),
+    { headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` } }
+  );
+
+  const listJson: any = await listRes.json().catch(() => null);
+  if (!listRes.ok) return json({ error: "Stripe error", details: listJson }, 400, request);
+
+  const customerId = listJson?.data?.[0]?.id ? String(listJson.data[0].id) : "";
+  if (!customerId) return json({ error: "No Stripe customer found for that email." }, 404, request);
+
+  // Create Billing Portal session
+  const form = new URLSearchParams();
+  form.set("customer", customerId);
+  form.set("return_url", "https://r4homeservice.com/manage");
+
+  const portalRes = await fetch("https://api.stripe.com/v1/billing_portal/sessions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.STRIPE_SECRET_KEY}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: form,
+  });
+
+  const portalJson: any = await portalRes.json().catch(() => null);
+  if (!portalRes.ok) return json({ error: "Stripe error", details: portalJson }, 400, request);
+
+  return json({ url: portalJson.url }, 200, request);
 }
 
 // =====================================================
