@@ -1,31 +1,34 @@
 // src/index.ts
 // =====================================================
-// R4 Stripe Worker + GoHighLevel Upsert Sync (ROBUST + BETTER LOGS)
+// R4 Stripe Worker + GoHighLevel Sync + Phone + SMS Opt-In
 //
 // Endpoints:
 //   POST /api/create-checkout-session
-//   POST /api/stripe-webhook   (signature verified, lifecycle events, GHL upsert)
+//   POST /api/stripe-webhook
 //
-// REQUIRED Worker Secrets (Cloudflare -> Worker -> Settings -> Variables -> Secrets):
+// REQUIRED Cloudflare Secrets:
 //   STRIPE_SECRET_KEY       = sk_test_... (or sk_live_... later)
 //   STRIPE_WEBHOOK_SECRET   = whsec_...
 //
-// REQUIRED for GoHighLevel sync (Cloudflare Secrets):
-//   GHL_PRIVATE_TOKEN       = (your GoHighLevel private integration token)
+// REQUIRED for GoHighLevel sync:
+//   GHL_PRIVATE_TOKEN       = (GoHighLevel private integration token, created INSIDE the sub-account)
 //   GHL_LOCATION_ID         = (your locationId)
 //
-// In GoHighLevel, create these Contact custom fields (keys must match exactly):
+// GoHighLevel Custom Fields (Contact) you should create (keys must match exactly):
 //   r4_part_number
 //   r4_service_summary
 //   r4_monthly_amount
 //   stripe_customer_id
 //   stripe_subscription_id
 //   stripe_subscription_status
-//   stripe_cancel_at_period_end
-//   stripe_current_period_end
-//   stripe_last_invoice_id
-//   stripe_last_invoice_paid_at
-//   stripe_last_invoice_amount
+//   r4_sms_opt_in
+//   r4_sms_opt_in_ts
+//
+// Notes:
+// - Stripe Checkout will collect phone number (native field)
+// - Stripe Checkout will collect SMS opt-in via a required dropdown custom field
+// - Webhook writes consent + phone into Stripe Customer metadata and upserts into GHL
+// - Strong logs: you can search Cloudflare logs for "Stripe event:" and "GHL upsert"
 // =====================================================
 
 export interface Env {
@@ -58,7 +61,9 @@ export default {
 };
 
 // =====================================================
-// Create Stripe Checkout Session (monthly subscription)
+// CREATE CHECKOUT SESSION (monthly subscription)
+// - Collect phone number
+// - Collect SMS opt-in (dropdown)
 // =====================================================
 async function handleCreateCheckoutSession(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return json({ error: "Method not allowed" }, 405, request);
@@ -88,6 +93,7 @@ async function handleCreateCheckoutSession(request: Request, env: Env): Promise<
     success_url: "https://r4homeservice.com/stripe-success?session_id={CHECKOUT_SESSION_ID}",
     cancel_url: "https://r4homeservice.com/stripe-cancel",
 
+    // Line item (monthly recurring)
     "line_items[0][quantity]": "1",
     "line_items[0][price_data][currency]": "usd",
     "line_items[0][price_data][recurring][interval]": "month",
@@ -95,6 +101,25 @@ async function handleCreateCheckoutSession(request: Request, env: Env): Promise<
     "line_items[0][price_data][product_data][name]": "R4 Home Service Plan",
     "line_items[0][price_data][product_data][description]":
       "Custom home service membership based on your selected services.",
+
+    // Collect phone number on Checkout
+    "phone_number_collection[enabled]": "true",
+    // Save phone onto the Stripe Customer automatically
+    "customer_update[phone]": "auto",
+
+    // SMS opt-in dropdown (required)
+    "custom_fields[0][key]": "sms_opt_in",
+    "custom_fields[0][label][type]": "custom",
+    "custom_fields[0][label][custom]": "Text message updates?",
+    "custom_fields[0][type]": "dropdown",
+    "custom_fields[0][dropdown][options][0][label]": "Yes, text me service updates",
+    "custom_fields[0][dropdown][options][0][value]": "yes",
+    "custom_fields[0][dropdown][options][1][label]": "No, do not text me",
+    "custom_fields[0][dropdown][options][1][value]": "no",
+
+    // Consent notice shown near submit button
+    "custom_text[submit][message]":
+      "If you choose Yes, you agree to receive recurring SMS from R4. Msg & data rates may apply. Reply STOP to opt out.",
 
     // SESSION metadata
     "metadata[partNumber]": partNumber,
@@ -107,6 +132,7 @@ async function handleCreateCheckoutSession(request: Request, env: Env): Promise<
     "subscription_data[metadata][monthlyAmount]": monthlyAmountNum.toFixed(2),
   };
 
+  // Optional email prefill
   if (customerEmail) params["customer_email"] = customerEmail;
 
   const stripeRes = await fetch("https://api.stripe.com/v1/checkout/sessions", {
@@ -125,12 +151,10 @@ async function handleCreateCheckoutSession(request: Request, env: Env): Promise<
 }
 
 // =====================================================
-// Stripe Webhook (signature verified) + lifecycle + GHL upsert
-// Handles:
-//   checkout.session.completed
-//   invoice.payment_succeeded
-//   customer.subscription.updated
-//   customer.subscription.deleted
+// STRIPE WEBHOOK (signature verified)
+// - checkout.session.completed -> update Stripe customer metadata + GHL upsert
+// - invoice.payment_succeeded -> logs only (optional future mapping to GHL)
+// - customer.subscription.updated/deleted -> logs + stripe customer metadata
 // =====================================================
 async function handleStripeWebhook(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
@@ -140,7 +164,7 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
   const sig = request.headers.get("Stripe-Signature");
   if (!sig) return new Response("Missing Stripe-Signature", { status: 400 });
 
-  // Read raw bytes for reliable signature verification
+  // Read raw bytes for signature verification
   const rawBuf = await request.arrayBuffer();
   const rawBody = new TextDecoder("utf-8").decode(rawBuf);
 
@@ -157,7 +181,6 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
   const type = String(event?.type || "");
   const obj = event?.data?.object;
 
-  // Helpful log so you can see what is firing
   console.log("Stripe event:", type);
 
   // -----------------------------
@@ -169,13 +192,17 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
     const customerId = session?.customer ? String(session.customer) : "";
     const subscriptionId = session?.subscription ? String(session.subscription) : "";
 
-    // Robust metadata retrieval
+    // metadata from session
     const md = session?.metadata || {};
     const partNumber = String(md.partNumber || "");
     const serviceSummary = String(md.serviceSummary || "");
     const monthlyAmount = String(md.monthlyAmount || "");
 
-    // Robust email/phone/name retrieval
+    // sms opt-in from custom_fields
+    const smsOptIn = getCustomFieldValue(session, "sms_opt_in"); // "yes" or "no"
+    const smsOptInTs = new Date().toISOString();
+
+    // Contact info (robust)
     let email = String(
       session?.customer_details?.email ||
         session?.customer_email ||
@@ -186,31 +213,35 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
     let phone = String(session?.customer_details?.phone || "").trim();
     let name = String(session?.customer_details?.name || "").trim();
 
-    // If email is still missing, fetch from Stripe Customer record
-    if (!email && customerId) {
+    // If missing, fetch from Stripe Customer
+    if ((!email || !phone || !name) && customerId) {
       const cust = await stripeGetCustomer(env.STRIPE_SECRET_KEY, customerId);
-      email = String(cust?.email || "").trim();
+      if (!email) email = String(cust?.email || "").trim();
       if (!phone) phone = String(cust?.phone || "").trim();
       if (!name) name = String(cust?.name || "").trim();
-      console.log("Fetched missing contact info from Stripe Customer:", {
-        email: email || "(none)",
-        phone: phone || "(none)",
-        name: name || "(none)",
-      });
     }
 
-    // Update Stripe Customer metadata
+    // Update Stripe Customer metadata (store consent proof + plan)
     if (customerId) {
       await stripeUpdateCustomerMetadata(env.STRIPE_SECRET_KEY, customerId, {
         partNumber,
         serviceSummary,
         monthlyAmount,
+
         stripeCustomerId: customerId,
         stripeSubscriptionId: subscriptionId,
         subscriptionStatus: "active",
         lastCheckoutSession: String(session?.id || ""),
+
+        smsOptIn: smsOptIn || "(missing)",
+        smsOptInTs,
+        smsPhone: phone || "(missing)",
       });
     }
+
+    // GHL tags
+    const tags = ["R4-Subscriber"];
+    if (smsOptIn === "yes") tags.push("SMS-OptIn");
 
     // Upsert contact in GoHighLevel (requires email or phone)
     if (!email && !phone) {
@@ -220,14 +251,18 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
         email,
         phone,
         name,
-        tags: ["R4-Subscriber"],
+        tags,
         custom: {
           r4_part_number: partNumber,
           r4_service_summary: serviceSummary,
           r4_monthly_amount: monthlyAmount,
+
           stripe_customer_id: customerId,
           stripe_subscription_id: subscriptionId,
           stripe_subscription_status: "active",
+
+          r4_sms_opt_in: smsOptIn,
+          r4_sms_opt_in_ts: smsOptInTs,
         },
       });
     }
@@ -260,9 +295,7 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
       });
     }
 
-    // If you want invoice data in GHL, we need a lookup strategy by Stripe customer id.
-    // For now, we only log (to avoid creating new contacts with no email/phone).
-    console.log("Invoice paid:", { invoiceId, amountPaid, subscriptionId, customerId });
+    console.log("Invoice paid:", { invoiceId, amountPaid, customerId, subscriptionId });
   }
 
   // -----------------------------
@@ -289,9 +322,6 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
     }
 
     console.log("Subscription updated:", { customerId, status, cancelAtPeriodEnd, currentPeriodEnd });
-
-    // Optional: update GHL status IF you have a way to find the contact.
-    // Best approach: store a map (Stripe customer id -> GHL contact id) in D1/KV later.
   }
 
   // -----------------------------
@@ -315,6 +345,20 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
 }
 
 // =====================================================
+// Read a Stripe Checkout Session custom field value
+// - For dropdown: found.dropdown.value
+// - For text: found.text.value
+// =====================================================
+function getCustomFieldValue(session: any, key: string): string {
+  const arr = session?.custom_fields;
+  if (!Array.isArray(arr)) return "";
+  const found = arr.find((x: any) => x?.key === key);
+  if (!found) return "";
+  const v = found?.dropdown?.value ?? found?.text?.value ?? "";
+  return String(v || "").trim();
+}
+
+// =====================================================
 // GoHighLevel: Contacts Upsert (better error logging)
 // =====================================================
 async function ghlUpsertContact(
@@ -327,7 +371,6 @@ async function ghlUpsertContact(
     custom: Record<string, string>;
   }
 ) {
-  // Fail softly so Stripe webhook still returns 200
   if (!env.GHL_PRIVATE_TOKEN || !env.GHL_LOCATION_ID) {
     console.log("GHL not configured: missing GHL_PRIVATE_TOKEN or GHL_LOCATION_ID. Skipping upsert.");
     return;
@@ -373,13 +416,12 @@ async function ghlUpsertContact(
     return;
   }
 
-  // log success response so you can see contact id
   const j = await res.json().catch(() => null);
   console.log("GHL upsert success:", j);
 }
 
 // =====================================================
-// Stripe helper: Get customer (to fill missing email/phone)
+// Stripe helper: Get customer (to fill missing email/phone/name)
 // =====================================================
 async function stripeGetCustomer(stripeSecretKey: string, customerId: string): Promise<any> {
   const res = await fetch(`https://api.stripe.com/v1/customers/${encodeURIComponent(customerId)}`, {
