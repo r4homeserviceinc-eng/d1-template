@@ -51,7 +51,12 @@ export default {
     if (url.pathname === "/api/create-checkout-session") {
       return handleCreateCheckoutSession(request, env);
     }
-
+    
+if (url.pathname === "/api/get-checkout-contact") {
+  return handleGetCheckoutContact(request, env);
+  
+}
+    
     if (url.pathname === "/api/create-billing-portal") {
   return handleCreateBillingPortal(request, env);
 }
@@ -557,4 +562,70 @@ function json(obj: unknown, status: number, request: Request) {
       ...corsHeaders(request),
     },
   });
+}
+//=======================================================
+//Fetch Stripe Info and Place into Orientation Form
+//=======================================================
+async function handleGetCheckoutContact(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET") return json({ error: "Method not allowed" }, 405, request);
+  if (!env.STRIPE_SECRET_KEY) return json({ error: "Missing STRIPE_SECRET_KEY" }, 500, request);
+
+  const url = new URL(request.url);
+  const sessionId = String(url.searchParams.get("session_id") || "").trim();
+  if (!sessionId) return json({ error: "Missing session_id" }, 400, request);
+
+  // Pull the Checkout Session (expand customer + subscription for better coverage)
+  const stripeUrl =
+    "https://api.stripe.com/v1/checkout/sessions/" +
+    encodeURIComponent(sessionId) +
+    "?expand[]=customer&expand[]=subscription";
+
+  const res = await fetch(stripeUrl, {
+    headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` },
+  });
+
+  const s: any = await res.json().catch(() => null);
+  if (!res.ok) {
+    console.log("Stripe session lookup failed:", res.status, s);
+    return json({ error: "Stripe lookup failed", details: s }, 400, request);
+  }
+
+  // Best-effort email/phone/name extraction
+  const email =
+    String(
+      s?.customer_details?.email ||
+      s?.customer_email ||
+      s?.customer?.email ||
+      ""
+    ).trim();
+
+  const phone =
+    String(
+      s?.customer_details?.phone ||
+      s?.customer?.phone ||
+      ""
+    ).trim();
+
+  const name =
+    String(
+      s?.customer_details?.name ||
+      s?.customer?.name ||
+      ""
+    ).trim();
+
+  // Optional: also return metadata so you can prefill hidden fields if you want
+  const md = s?.metadata || {};
+
+  return json(
+    {
+      email,
+      phone,
+      name,
+      partNumber: String(md.partNumber || ""),
+      serviceSummary: String(md.serviceSummary || ""),
+      monthlyAmount: String(md.monthlyAmount || ""),
+    },
+    200,
+    request
+  );
 }
