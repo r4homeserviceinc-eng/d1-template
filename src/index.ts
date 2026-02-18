@@ -3,12 +3,15 @@
 // R4 Stripe Worker + GoHighLevel Upsert Sync (ROBUST + BETTER LOGS)
 // UPDATED:
 //  - Accept phone + smsOptIn from selector tool
-//  - Store phone + smsOptIn in Stripe metadata (session + subscription)
+//  - Store phone + smsOptIn in Stripe metadata (session + subscription or payment_intent)
 //  - Use metadata phone if Stripe checkout doesn't provide it
 //  - Add SMS-OptIn tag + custom fields to GHL
 //
 // Endpoints:
-//   POST /api/create-checkout-session
+//   POST /api/create-checkout-session                  (subscription)
+//   POST /api/create-one-time-checkout-session         (one-time payment)
+//   GET  /api/get-checkout-contact
+//   POST /api/create-billing-portal
 //   POST /api/stripe-webhook
 //
 // REQUIRED Worker Secrets:
@@ -18,17 +21,6 @@
 // OPTIONAL (for GHL sync):
 //   GHL_PRIVATE_TOKEN
 //   GHL_LOCATION_ID
-//
-// In GoHighLevel, create these Contact custom fields (keys must match exactly):
-//   r4_part_number
-//   r4_service_summary
-//   r4_monthly_amount
-//   stripe_customer_id
-//   stripe_subscription_id
-//   stripe_subscription_status
-//   r4_customer_phone
-//   r4_sms_opt_in
-//   r4_sms_opt_in_ts
 // =====================================================
 
 export interface Env {
@@ -48,26 +40,52 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders(request) });
     }
 
+    // Routes
     if (url.pathname === "/api/create-checkout-session") {
       return handleCreateCheckoutSession(request, env);
     }
-    
-if (url.pathname === "/api/get-checkout-contact") {
-  return handleGetCheckoutContact(request, env);
-  
-}
-    
+
+    if (url.pathname === "/api/create-one-time-checkout-session") {
+      return handleCreateOneTimeCheckoutSession(request, env);
+    }
+
+    if (url.pathname === "/api/get-checkout-contact") {
+      return handleGetCheckoutContact(request, env);
+    }
+
     if (url.pathname === "/api/create-billing-portal") {
-  return handleCreateBillingPortal(request, env);
-}
+      return handleCreateBillingPortal(request, env);
+    }
 
     if (url.pathname === "/api/stripe-webhook") {
+      // Stripe webhooks do not need CORS, but leaving it is fine.
       return handleStripeWebhook(request, env);
     }
 
     return new Response("Not found", { status: 404 });
   },
 };
+
+// =====================================================
+// Helpers: safe parsing
+// =====================================================
+function parseSmsOptIn(v: any): { smsOptIn: "yes" | "no"; smsOptInBool: boolean } {
+  // Accept: true/false, "true"/"false", "yes"/"no", 1/0
+  if (v === true || v === 1) return { smsOptIn: "yes", smsOptInBool: true };
+  if (v === false || v === 0) return { smsOptIn: "no", smsOptInBool: false };
+
+  const s = String(v ?? "").trim().toLowerCase();
+  if (s === "true" || s === "yes" || s === "y" || s === "1") return { smsOptIn: "yes", smsOptInBool: true };
+  return { smsOptIn: "no", smsOptInBool: false };
+}
+
+function isLikelyE164(phone: string): boolean {
+  // light validation: + and at least 10 digits total
+  const p = String(phone || "").trim();
+  if (!p.startsWith("+")) return false;
+  const digits = p.replace(/\D/g, "");
+  return digits.length >= 10 && digits.length <= 15;
+}
 
 // =====================================================
 // Create Stripe Checkout Session (monthly subscription)
@@ -84,14 +102,12 @@ async function handleCreateCheckoutSession(request: Request, env: Env): Promise<
   }
 
   const partNumber = String(body?.partNumber ?? "").trim();
-  const serviceSummary = String(body?.serviceSummary ?? "");
+  const serviceSummary = String(body?.serviceSummary ?? "").trim();
   const customerEmail = String(body?.customerEmail ?? "").trim();
 
-  // NEW: phone + sms opt-in from selector
-  // phone is expected in E.164 like +13525551234 (your selector normalizes)
+  // phone + sms opt-in from selector
   const selectorPhone = String(body?.phone ?? "").trim();
-  const smsOptInBool = Boolean(body?.smsOptIn);
-  const smsOptIn = smsOptInBool ? "yes" : "no";
+  const { smsOptIn, smsOptInBool } = parseSmsOptIn(body?.smsOptIn);
   const smsOptInTs = new Date().toISOString();
 
   const monthlyAmountNum = Number(body?.monthlyAmount);
@@ -102,10 +118,8 @@ async function handleCreateCheckoutSession(request: Request, env: Env): Promise<
     return json({ error: "monthlyAmount must be a positive number" }, 400, request);
   }
 
-  // Optional: require phone if you want to enforce it server-side too
-  // (selector already enforces, but this prevents direct calls without phone)
-  if (!selectorPhone) {
-    return json({ error: "Missing phone" }, 400, request);
+  if (!selectorPhone || !isLikelyE164(selectorPhone)) {
+    return json({ error: "Missing or invalid phone (E.164 required)" }, 400, request);
   }
 
   const params: Record<string, string> = {
@@ -121,27 +135,22 @@ async function handleCreateCheckoutSession(request: Request, env: Env): Promise<
     "line_items[0][price_data][product_data][description]":
       "Custom home service membership based on your selected services.",
 
-    // NOTE:
-    // We are NOT using Stripe's phone_number_collection here because it shows
-    // the "save my info for faster checkout" Link UI.
-    // Phone is collected on the selector and stored in metadata.
-
     // SESSION metadata
+    "metadata[purchaseType]": "subscription",
     "metadata[partNumber]": partNumber,
     "metadata[serviceSummary]": serviceSummary,
     "metadata[monthlyAmount]": monthlyAmountNum.toFixed(2),
 
-    // NEW: store selector phone + sms consent on session metadata
     "metadata[selectorPhone]": selectorPhone,
     "metadata[smsOptIn]": smsOptIn,
     "metadata[smsOptInTs]": smsOptInTs,
 
     // SUBSCRIPTION metadata
+    "subscription_data[metadata][purchaseType]": "subscription",
     "subscription_data[metadata][partNumber]": partNumber,
     "subscription_data[metadata][serviceSummary]": serviceSummary,
     "subscription_data[metadata][monthlyAmount]": monthlyAmountNum.toFixed(2),
 
-    // NEW: store selector phone + sms consent on subscription metadata too
     "subscription_data[metadata][selectorPhone]": selectorPhone,
     "subscription_data[metadata][smsOptIn]": smsOptIn,
     "subscription_data[metadata][smsOptInTs]": smsOptInTs,
@@ -160,12 +169,100 @@ async function handleCreateCheckoutSession(request: Request, env: Env): Promise<
 
   const stripeJson: any = await stripeRes.json().catch(() => null);
   if (!stripeRes.ok) {
-    console.log("Stripe create session failed:", stripeRes.status, stripeJson);
+    console.log("Stripe create subscription session failed:", stripeRes.status, stripeJson);
     return json({ error: "Stripe error", details: stripeJson }, 400, request);
   }
 
   return json({ url: stripeJson.url }, 200, request);
 }
+
+// =====================================================
+// Create Stripe Checkout Session (one-time payment)
+// =====================================================
+async function handleCreateOneTimeCheckoutSession(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") return json({ error: "Method not allowed" }, 405, request);
+  if (!env.STRIPE_SECRET_KEY) return json({ error: "Missing STRIPE_SECRET_KEY" }, 500, request);
+
+  let body: any;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON" }, 400, request);
+  }
+
+  const partNumber = String(body?.partNumber ?? "").trim();
+  const serviceSummary = String(body?.serviceSummary ?? "").trim();
+
+  const selectorPhone = String(body?.phone ?? "").trim();
+  const { smsOptIn } = parseSmsOptIn(body?.smsOptIn);
+  const smsOptInTs = new Date().toISOString();
+
+  const oneTimeAmountNum = Number(body?.oneTimeAmount);
+  const amountCents = Math.round(oneTimeAmountNum * 100);
+
+  if (!partNumber) return json({ error: "Missing partNumber" }, 400, request);
+  if (!serviceSummary) return json({ error: "Missing serviceSummary" }, 400, request);
+
+  if (!Number.isFinite(oneTimeAmountNum) || amountCents <= 0) {
+    return json({ error: "oneTimeAmount must be a positive number" }, 400, request);
+  }
+
+  if (!selectorPhone || !isLikelyE164(selectorPhone)) {
+    return json({ error: "Missing or invalid phone (E.164 required)" }, 400, request);
+  }
+
+  const params: Record<string, string> = {
+    mode: "payment",
+    customer_creation: "always",
+    success_url: "https://r4homeservice.com/stripe-success?session_id={CHECKOUT_SESSION_ID}",
+    cancel_url: "https://r4homeservice.com/stripe-cancel",
+
+    "line_items[0][quantity]": "1",
+    "line_items[0][price_data][currency]": "usd",
+    "line_items[0][price_data][unit_amount]": String(amountCents),
+    "line_items[0][price_data][product_data][name]": "R4 Home Service — One-Time Visit",
+    "line_items[0][price_data][product_data][description]": serviceSummary,
+
+    // SESSION metadata
+    "metadata[purchaseType]": "one_time",
+    "metadata[partNumber]": partNumber,
+    "metadata[serviceSummary]": serviceSummary,
+    "metadata[oneTimeAmount]": oneTimeAmountNum.toFixed(2),
+    "metadata[selectorPhone]": selectorPhone,
+    "metadata[smsOptIn]": smsOptIn,
+    "metadata[smsOptInTs]": smsOptInTs,
+
+    // PaymentIntent metadata (Stripe recommends this for payment mode)
+    "payment_intent_data[metadata][purchaseType]": "one_time",
+    "payment_intent_data[metadata][partNumber]": partNumber,
+    "payment_intent_data[metadata][serviceSummary]": serviceSummary,
+    "payment_intent_data[metadata][oneTimeAmount]": oneTimeAmountNum.toFixed(2),
+    "payment_intent_data[metadata][selectorPhone]": selectorPhone,
+    "payment_intent_data[metadata][smsOptIn]": smsOptIn,
+    "payment_intent_data[metadata][smsOptInTs]": smsOptInTs,
+  };
+
+  const stripeRes = await fetch("https://api.stripe.com/v1/checkout/sessions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.STRIPE_SECRET_KEY}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams(params),
+  });
+
+  const stripeJson: any = await stripeRes.json().catch(() => null);
+  if (!stripeRes.ok) {
+    console.log("Stripe create one-time session failed:", stripeRes.status, stripeJson);
+    return json({ error: "Stripe error", details: stripeJson }, 400, request);
+  }
+
+  return json({ url: stripeJson.url }, 200, request);
+}
+
+// =====================================================
+// Billing Portal
+// =====================================================
 async function handleCreateBillingPortal(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return json({ error: "Method not allowed" }, 405, request);
   if (!env.STRIPE_SECRET_KEY) return json({ error: "Missing STRIPE_SECRET_KEY" }, 500, request);
@@ -180,7 +277,6 @@ async function handleCreateBillingPortal(request: Request, env: Env): Promise<Re
   const email = String(body?.email ?? "").trim().toLowerCase();
   if (!email) return json({ error: "Missing email" }, 400, request);
 
-  // Find Stripe customer by email
   const listRes = await fetch(
     "https://api.stripe.com/v1/customers?limit=1&email=" + encodeURIComponent(email),
     { headers: { Authorization: `Bearer ${env.STRIPE_SECRET_KEY}` } }
@@ -192,7 +288,6 @@ async function handleCreateBillingPortal(request: Request, env: Env): Promise<Re
   const customerId = listJson?.data?.[0]?.id ? String(listJson.data[0].id) : "";
   if (!customerId) return json({ error: "No Stripe customer found for that email." }, 404, request);
 
-  // Create Billing Portal session
   const form = new URLSearchParams();
   form.set("customer", customerId);
   form.set("return_url", "https://r4homeservice.com/manage");
@@ -244,24 +339,27 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
   if (type === "checkout.session.completed") {
     const session = obj;
 
+    const mode = String(session?.mode || "");
     const customerId = session?.customer ? String(session.customer) : "";
     const subscriptionId = session?.subscription ? String(session.subscription) : "";
 
     const md = session?.metadata || {};
+    const purchaseType = String(md.purchaseType || (mode === "payment" ? "one_time" : "subscription"));
+
     const partNumber = String(md.partNumber || "");
     const serviceSummary = String(md.serviceSummary || "");
     const monthlyAmount = String(md.monthlyAmount || "");
+    const oneTimeAmount = String(md.oneTimeAmount || "");
 
-    // NEW: pull phone + sms consent from metadata
     const selectorPhone = String(md.selectorPhone || "").trim();
-    const smsOptIn = String(md.smsOptIn || "").trim();       // "yes" | "no"
-    const smsOptInTs = String(md.smsOptInTs || "").trim();   // ISO string
+    const smsOptIn = String(md.smsOptIn || "").trim();     // "yes" | "no"
+    const smsOptInTs = String(md.smsOptInTs || "").trim(); // ISO string
 
     let email = String(
       session?.customer_details?.email ||
-      session?.customer_email ||
-      session?.customer_details?.email_address ||
-      ""
+        session?.customer_email ||
+        session?.customer_details?.email_address ||
+        ""
     ).trim();
 
     // Use Stripe phone if present, else fall back to selector metadata phone
@@ -271,11 +369,11 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
     let name = String(session?.customer_details?.name || "").trim();
 
     // If missing email/name still, try Stripe customer
-    if ((!email || !name) && customerId) {
+    if ((!email || !name || !phone) && customerId) {
       const cust = await stripeGetCustomer(env.STRIPE_SECRET_KEY, customerId);
       if (!email) email = String(cust?.email || "").trim();
       if (!name) name = String(cust?.name || "").trim();
-      if (!phone) phone = String(cust?.phone || "").trim(); // last resort
+      if (!phone) phone = String(cust?.phone || "").trim();
     }
 
     // Update Stripe Customer metadata
@@ -283,13 +381,13 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
       await stripeUpdateCustomerMetadata(env.STRIPE_SECRET_KEY, customerId, {
         partNumber,
         serviceSummary,
-        monthlyAmount,
+        monthlyAmount: monthlyAmount || "",
+        oneTimeAmount: oneTimeAmount || "",
+        purchaseType,
         stripeCustomerId: customerId,
         stripeSubscriptionId: subscriptionId,
-        subscriptionStatus: "active",
+        subscriptionStatus: subscriptionId ? "active" : "n/a",
         lastCheckoutSession: String(session?.id || ""),
-
-        // NEW
         selectorPhone: selectorPhone || phone,
         smsOptIn,
         smsOptInTs,
@@ -297,10 +395,11 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
     }
 
     // Build tags for GHL
-    const tags = ["R4-Subscriber"];
+    const tags: string[] = [];
+    if (purchaseType === "subscription") tags.push("R4-Subscriber");
+    if (purchaseType === "one_time") tags.push("R4-OneTime");
     if (smsOptIn === "yes") tags.push("SMS-OptIn");
 
-    // Upsert contact in GoHighLevel (requires email or phone)
     if (!email && !phone) {
       console.log("Skipping GHL upsert: no email/phone available from Stripe session/customer.");
     } else {
@@ -315,12 +414,13 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
           r4_monthly_amount: monthlyAmount,
           stripe_customer_id: customerId,
           stripe_subscription_id: subscriptionId,
-          stripe_subscription_status: "active",
-
-          // NEW custom fields
+          stripe_subscription_status: subscriptionId ? "active" : "n/a",
           r4_customer_phone: phone,
           r4_sms_opt_in: smsOptIn,
           r4_sms_opt_in_ts: smsOptInTs,
+          // Optional convenience fields:
+          r4_purchase_type: purchaseType,
+          r4_one_time_amount: oneTimeAmount,
         },
       });
     }
@@ -361,9 +461,7 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
     const cancelAtPeriodEnd = Boolean(sub?.cancel_at_period_end);
 
     const currentPeriodEnd =
-      sub?.current_period_end
-        ? new Date(Number(sub.current_period_end) * 1000).toISOString()
-        : "";
+      sub?.current_period_end ? new Date(Number(sub.current_period_end) * 1000).toISOString() : "";
 
     if (customerId) {
       await stripeUpdateCustomerMetadata(env.STRIPE_SECRET_KEY, customerId, {
@@ -548,8 +646,8 @@ function corsHeaders(request: Request) {
   const origin = request.headers.get("Origin") || "*";
   return {
     "Access-Control-Allow-Origin": origin,
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Stripe-Signature",
     Vary: "Origin",
   };
 }
@@ -563,8 +661,9 @@ function json(obj: unknown, status: number, request: Request) {
     },
   });
 }
+
 //=======================================================
-//Fetch Stripe Info and Place into Orientation Form
+// Fetch Stripe Info and Place into Orientation Form
 //=======================================================
 async function handleGetCheckoutContact(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") return json({ error: "Method not allowed" }, 405, request);
@@ -574,7 +673,6 @@ async function handleGetCheckoutContact(request: Request, env: Env): Promise<Res
   const sessionId = String(url.searchParams.get("session_id") || "").trim();
   if (!sessionId) return json({ error: "Missing session_id" }, 400, request);
 
-  // Pull the Checkout Session (expand customer + subscription for better coverage)
   const stripeUrl =
     "https://api.stripe.com/v1/checkout/sessions/" +
     encodeURIComponent(sessionId) +
@@ -590,30 +688,10 @@ async function handleGetCheckoutContact(request: Request, env: Env): Promise<Res
     return json({ error: "Stripe lookup failed", details: s }, 400, request);
   }
 
-  // Best-effort email/phone/name extraction
-  const email =
-    String(
-      s?.customer_details?.email ||
-      s?.customer_email ||
-      s?.customer?.email ||
-      ""
-    ).trim();
+  const email = String(s?.customer_details?.email || s?.customer_email || s?.customer?.email || "").trim();
+  const phone = String(s?.customer_details?.phone || s?.customer?.phone || "").trim();
+  const name = String(s?.customer_details?.name || s?.customer?.name || "").trim();
 
-  const phone =
-    String(
-      s?.customer_details?.phone ||
-      s?.customer?.phone ||
-      ""
-    ).trim();
-
-  const name =
-    String(
-      s?.customer_details?.name ||
-      s?.customer?.name ||
-      ""
-    ).trim();
-
-  // Optional: also return metadata so you can prefill hidden fields if you want
   const md = s?.metadata || {};
 
   return json(
@@ -621,9 +699,11 @@ async function handleGetCheckoutContact(request: Request, env: Env): Promise<Res
       email,
       phone,
       name,
+      purchaseType: String(md.purchaseType || ""),
       partNumber: String(md.partNumber || ""),
       serviceSummary: String(md.serviceSummary || ""),
       monthlyAmount: String(md.monthlyAmount || ""),
+      oneTimeAmount: String(md.oneTimeAmount || ""),
     },
     200,
     request
