@@ -1,15 +1,17 @@
 // src/index.ts
 // =====================================================
-// R4 Stripe Worker + GoHighLevel Upsert Sync (ROBUST + BETTER LOGS)
+// R4 Stripe Worker + GoHighLevel Upsert Sync
+//
 // UPDATED:
 //  - Accept phone + smsOptIn from selector tool
-//  - Store phone + smsOptIn in Stripe metadata (session + subscription or payment_intent)
-//  - Use metadata phone if Stripe checkout doesn't provide it
-//  - Add SMS-OptIn tag + custom fields to GHL
+//  - Store phone + smsOptIn in Stripe metadata
+//  - Parse R4 part numbers into structured fields
+//  - Add House Washing tier support for GHL
+//  - Push richer custom fields into GHL
 //
 // Endpoints:
-//   POST /api/create-checkout-session                  (subscription)
-//   POST /api/create-one-time-checkout-session         (one-time payment)
+//   POST /api/create-checkout-session
+//   POST /api/create-one-time-checkout-session
 //   GET  /api/get-checkout-contact
 //   POST /api/create-billing-portal
 //   POST /api/stripe-webhook
@@ -18,7 +20,7 @@
 //   STRIPE_SECRET_KEY
 //   STRIPE_WEBHOOK_SECRET
 //
-// OPTIONAL (for GHL sync):
+// OPTIONAL:
 //   GHL_PRIVATE_TOKEN
 //   GHL_LOCATION_ID
 // =====================================================
@@ -31,16 +33,29 @@ export interface Env {
   GHL_LOCATION_ID?: string;
 }
 
+type ParsedPlanItem = {
+  raw: string;
+  serviceKey: string;
+  tierKey: string;
+  frequency: string;
+  purchaseType: "subscription" | "one_time";
+};
+
+type ParsedPartNumber = {
+  items: ParsedPlanItem[];
+  serviceKeysCsv: string;
+  frequenciesCsv: string;
+  housewashTier: string;
+};
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // CORS preflight
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders(request) });
     }
 
-    // Routes
     if (url.pathname === "/api/create-checkout-session") {
       return handleCreateCheckoutSession(request, env);
     }
@@ -58,7 +73,6 @@ export default {
     }
 
     if (url.pathname === "/api/stripe-webhook") {
-      // Stripe webhooks do not need CORS, but leaving it is fine.
       return handleStripeWebhook(request, env);
     }
 
@@ -67,28 +81,123 @@ export default {
 };
 
 // =====================================================
-// Helpers: safe parsing
+// Helpers
 // =====================================================
 function parseSmsOptIn(v: any): { smsOptIn: "yes" | "no"; smsOptInBool: boolean } {
-  // Accept: true/false, "true"/"false", "yes"/"no", 1/0
   if (v === true || v === 1) return { smsOptIn: "yes", smsOptInBool: true };
   if (v === false || v === 0) return { smsOptIn: "no", smsOptInBool: false };
 
   const s = String(v ?? "").trim().toLowerCase();
-  if (s === "true" || s === "yes" || s === "y" || s === "1") return { smsOptIn: "yes", smsOptInBool: true };
+  if (s === "true" || s === "yes" || s === "y" || s === "1") {
+    return { smsOptIn: "yes", smsOptInBool: true };
+  }
   return { smsOptIn: "no", smsOptInBool: false };
 }
 
 function isLikelyE164(phone: string): boolean {
-  // light validation: + and at least 10 digits total
   const p = String(phone || "").trim();
   if (!p.startsWith("+")) return false;
   const digits = p.replace(/\D/g, "");
   return digits.length >= 10 && digits.length <= 15;
 }
 
+function cleanString(v: unknown): string {
+  return String(v ?? "").trim();
+}
+
+function uniq(arr: string[]): string[] {
+  return Array.from(new Set(arr.filter(Boolean)));
+}
+
+function normalizeFrequency(freq: string): string {
+  const f = String(freq || "").trim().toLowerCase();
+  if (f === "weekly") return "weekly";
+  if (f === "monthly") return "monthly";
+  if (f === "quarterly") return "quarterly";
+  if (f === "semiannually") return "semiannually";
+  if (f === "annually") return "annually";
+  if (f === "onetime" || f === "one_time") return "onetime";
+  return f;
+}
+
+function humanizeHousewashTier(tierKey: string): string {
+  const t = String(tierKey || "").trim().toLowerCase();
+  if (t === "0to2000") return "0–2,000 sq ft";
+  if (t === "2000to3500") return "2,001–3,500 sq ft";
+  if (t === "3500to5000") return "3,501–5,000 sq ft";
+  return tierKey;
+}
+
+/**
+ * Supported examples:
+ * R4HS__gutter-quarterly
+ * R4HS__housewash-0to2000-quarterly
+ * R4HS__housewash-2000to3500-onetime
+ * R4HS__gutter-quarterly__housewash-3500to5000-annually
+ */
+function parsePartNumber(partNumber: string): ParsedPartNumber {
+  const raw = cleanString(partNumber);
+  if (!raw.startsWith("R4HS__")) {
+    return {
+      items: [],
+      serviceKeysCsv: "",
+      frequenciesCsv: "",
+      housewashTier: "",
+    };
+  }
+
+  const chunks = raw.replace(/^R4HS__/, "").split("__").map(s => s.trim()).filter(Boolean);
+  const items: ParsedPlanItem[] = [];
+
+  for (const chunk of chunks) {
+    const parts = chunk.split("-").map(s => s.trim()).filter(Boolean);
+
+    if (parts.length === 2) {
+      const [serviceKey, frequencyRaw] = parts;
+      items.push({
+        raw: chunk,
+        serviceKey,
+        tierKey: "",
+        frequency: normalizeFrequency(frequencyRaw),
+        purchaseType: normalizeFrequency(frequencyRaw) === "onetime" ? "one_time" : "subscription",
+      });
+      continue;
+    }
+
+    if (parts.length === 3) {
+      const [serviceKey, maybeTier, frequencyRaw] = parts;
+      items.push({
+        raw: chunk,
+        serviceKey,
+        tierKey: maybeTier,
+        frequency: normalizeFrequency(frequencyRaw),
+        purchaseType: normalizeFrequency(frequencyRaw) === "onetime" ? "one_time" : "subscription",
+      });
+      continue;
+    }
+
+    console.log("Unrecognized part number chunk:", chunk);
+  }
+
+  const serviceKeysCsv = uniq(items.map(i => i.serviceKey)).join(", ");
+  const frequenciesCsv = uniq(
+    items
+      .map(i => (i.frequency === "onetime" ? "one_time" : i.frequency))
+      .filter(Boolean)
+  ).join(", ");
+
+  const housewashTier = items.find(i => i.serviceKey === "housewash" && i.tierKey)?.tierKey || "";
+
+  return {
+    items,
+    serviceKeysCsv,
+    frequenciesCsv,
+    housewashTier,
+  };
+}
+
 // =====================================================
-// Create Stripe Checkout Session (monthly subscription)
+// Create Stripe Checkout Session (subscription)
 // =====================================================
 async function handleCreateCheckoutSession(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return json({ error: "Method not allowed" }, 405, request);
@@ -101,13 +210,12 @@ async function handleCreateCheckoutSession(request: Request, env: Env): Promise<
     return json({ error: "Invalid JSON" }, 400, request);
   }
 
-  const partNumber = String(body?.partNumber ?? "").trim();
-  const serviceSummary = String(body?.serviceSummary ?? "").trim();
-  const customerEmail = String(body?.customerEmail ?? "").trim();
+  const partNumber = cleanString(body?.partNumber);
+  const serviceSummary = cleanString(body?.serviceSummary);
+  const customerEmail = cleanString(body?.customerEmail);
 
-  // phone + sms opt-in from selector
-  const selectorPhone = String(body?.phone ?? "").trim();
-  const { smsOptIn, smsOptInBool } = parseSmsOptIn(body?.smsOptIn);
+  const selectorPhone = cleanString(body?.phone);
+  const { smsOptIn } = parseSmsOptIn(body?.smsOptIn);
   const smsOptInTs = new Date().toISOString();
 
   const monthlyAmountNum = Number(body?.monthlyAmount);
@@ -117,7 +225,6 @@ async function handleCreateCheckoutSession(request: Request, env: Env): Promise<
   if (!Number.isFinite(monthlyAmountNum) || amountCents <= 0) {
     return json({ error: "monthlyAmount must be a positive number" }, 400, request);
   }
-
   if (!selectorPhone || !isLikelyE164(selectorPhone)) {
     return json({ error: "Missing or invalid phone (E.164 required)" }, 400, request);
   }
@@ -135,22 +242,18 @@ async function handleCreateCheckoutSession(request: Request, env: Env): Promise<
     "line_items[0][price_data][product_data][description]":
       "Custom home service membership based on your selected services.",
 
-    // SESSION metadata
     "metadata[purchaseType]": "subscription",
     "metadata[partNumber]": partNumber,
     "metadata[serviceSummary]": serviceSummary,
     "metadata[monthlyAmount]": monthlyAmountNum.toFixed(2),
-
     "metadata[selectorPhone]": selectorPhone,
     "metadata[smsOptIn]": smsOptIn,
     "metadata[smsOptInTs]": smsOptInTs,
 
-    // SUBSCRIPTION metadata
     "subscription_data[metadata][purchaseType]": "subscription",
     "subscription_data[metadata][partNumber]": partNumber,
     "subscription_data[metadata][serviceSummary]": serviceSummary,
     "subscription_data[metadata][monthlyAmount]": monthlyAmountNum.toFixed(2),
-
     "subscription_data[metadata][selectorPhone]": selectorPhone,
     "subscription_data[metadata][smsOptIn]": smsOptIn,
     "subscription_data[metadata][smsOptInTs]": smsOptInTs,
@@ -177,7 +280,7 @@ async function handleCreateCheckoutSession(request: Request, env: Env): Promise<
 }
 
 // =====================================================
-// Create Stripe Checkout Session (one-time payment)
+// Create Stripe Checkout Session (one-time)
 // =====================================================
 async function handleCreateOneTimeCheckoutSession(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return json({ error: "Method not allowed" }, 405, request);
@@ -190,10 +293,10 @@ async function handleCreateOneTimeCheckoutSession(request: Request, env: Env): P
     return json({ error: "Invalid JSON" }, 400, request);
   }
 
-  const partNumber = String(body?.partNumber ?? "").trim();
-  const serviceSummary = String(body?.serviceSummary ?? "").trim();
+  const partNumber = cleanString(body?.partNumber);
+  const serviceSummary = cleanString(body?.serviceSummary);
 
-  const selectorPhone = String(body?.phone ?? "").trim();
+  const selectorPhone = cleanString(body?.phone);
   const { smsOptIn } = parseSmsOptIn(body?.smsOptIn);
   const smsOptInTs = new Date().toISOString();
 
@@ -202,11 +305,9 @@ async function handleCreateOneTimeCheckoutSession(request: Request, env: Env): P
 
   if (!partNumber) return json({ error: "Missing partNumber" }, 400, request);
   if (!serviceSummary) return json({ error: "Missing serviceSummary" }, 400, request);
-
   if (!Number.isFinite(oneTimeAmountNum) || amountCents <= 0) {
     return json({ error: "oneTimeAmount must be a positive number" }, 400, request);
   }
-
   if (!selectorPhone || !isLikelyE164(selectorPhone)) {
     return json({ error: "Missing or invalid phone (E.164 required)" }, 400, request);
   }
@@ -223,7 +324,6 @@ async function handleCreateOneTimeCheckoutSession(request: Request, env: Env): P
     "line_items[0][price_data][product_data][name]": "R4 Home Service — One-Time Visit",
     "line_items[0][price_data][product_data][description]": serviceSummary,
 
-    // SESSION metadata
     "metadata[purchaseType]": "one_time",
     "metadata[partNumber]": partNumber,
     "metadata[serviceSummary]": serviceSummary,
@@ -232,7 +332,6 @@ async function handleCreateOneTimeCheckoutSession(request: Request, env: Env): P
     "metadata[smsOptIn]": smsOptIn,
     "metadata[smsOptInTs]": smsOptInTs,
 
-    // PaymentIntent metadata (Stripe recommends this for payment mode)
     "payment_intent_data[metadata][purchaseType]": "one_time",
     "payment_intent_data[metadata][partNumber]": partNumber,
     "payment_intent_data[metadata][serviceSummary]": serviceSummary,
@@ -274,7 +373,7 @@ async function handleCreateBillingPortal(request: Request, env: Env): Promise<Re
     return json({ error: "Invalid JSON" }, 400, request);
   }
 
-  const email = String(body?.email ?? "").trim().toLowerCase();
+  const email = cleanString(body?.email).toLowerCase();
   if (!email) return json({ error: "Missing email" }, 400, request);
 
   const listRes = await fetch(
@@ -308,7 +407,7 @@ async function handleCreateBillingPortal(request: Request, env: Env): Promise<Re
 }
 
 // =====================================================
-// Stripe Webhook (signature verified) + lifecycle + GHL upsert
+// Stripe Webhook
 // =====================================================
 async function handleStripeWebhook(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
@@ -339,44 +438,43 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
   if (type === "checkout.session.completed") {
     const session = obj;
 
-    const mode = String(session?.mode || "");
-    const customerId = session?.customer ? String(session.customer) : "";
-    const subscriptionId = session?.subscription ? String(session.subscription) : "";
+    const mode = cleanString(session?.mode);
+    const customerId = cleanString(session?.customer);
+    const subscriptionId = cleanString(session?.subscription);
 
     const md = session?.metadata || {};
-    const purchaseType = String(md.purchaseType || (mode === "payment" ? "one_time" : "subscription"));
+    const purchaseType = cleanString(md.purchaseType || (mode === "payment" ? "one_time" : "subscription"));
 
-    const partNumber = String(md.partNumber || "");
-    const serviceSummary = String(md.serviceSummary || "");
-    const monthlyAmount = String(md.monthlyAmount || "");
-    const oneTimeAmount = String(md.oneTimeAmount || "");
+    const partNumber = cleanString(md.partNumber);
+    const serviceSummary = cleanString(md.serviceSummary);
+    const monthlyAmount = cleanString(md.monthlyAmount);
+    const oneTimeAmount = cleanString(md.oneTimeAmount);
 
-    const selectorPhone = String(md.selectorPhone || "").trim();
-    const smsOptIn = String(md.smsOptIn || "").trim();     // "yes" | "no"
-    const smsOptInTs = String(md.smsOptInTs || "").trim(); // ISO string
+    const selectorPhone = cleanString(md.selectorPhone);
+    const smsOptIn = cleanString(md.smsOptIn);
+    const smsOptInTs = cleanString(md.smsOptInTs);
 
-    let email = String(
+    const parsed = parsePartNumber(partNumber);
+
+    let email = cleanString(
       session?.customer_details?.email ||
-        session?.customer_email ||
-        session?.customer_details?.email_address ||
-        ""
-    ).trim();
+      session?.customer_email ||
+      session?.customer_details?.email_address ||
+      ""
+    );
 
-    // Use Stripe phone if present, else fall back to selector metadata phone
-    let phone = String(session?.customer_details?.phone || "").trim();
+    let phone = cleanString(session?.customer_details?.phone);
     if (!phone && selectorPhone) phone = selectorPhone;
 
-    let name = String(session?.customer_details?.name || "").trim();
+    let name = cleanString(session?.customer_details?.name);
 
-    // If missing email/name still, try Stripe customer
     if ((!email || !name || !phone) && customerId) {
       const cust = await stripeGetCustomer(env.STRIPE_SECRET_KEY, customerId);
-      if (!email) email = String(cust?.email || "").trim();
-      if (!name) name = String(cust?.name || "").trim();
-      if (!phone) phone = String(cust?.phone || "").trim();
+      if (!email) email = cleanString(cust?.email);
+      if (!name) name = cleanString(cust?.name);
+      if (!phone) phone = cleanString(cust?.phone);
     }
 
-    // Update Stripe Customer metadata
     if (customerId) {
       await stripeUpdateCustomerMetadata(env.STRIPE_SECRET_KEY, customerId, {
         partNumber,
@@ -387,18 +485,22 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
         stripeCustomerId: customerId,
         stripeSubscriptionId: subscriptionId,
         subscriptionStatus: subscriptionId ? "active" : "n/a",
-        lastCheckoutSession: String(session?.id || ""),
+        lastCheckoutSession: cleanString(session?.id),
         selectorPhone: selectorPhone || phone,
         smsOptIn,
         smsOptInTs,
+        r4ServiceKeys: parsed.serviceKeysCsv,
+        r4Frequencies: parsed.frequenciesCsv,
+        r4HousewashTier: parsed.housewashTier,
       });
     }
 
-    // Build tags for GHL
     const tags: string[] = [];
     if (purchaseType === "subscription") tags.push("R4-Subscriber");
     if (purchaseType === "one_time") tags.push("R4-OneTime");
     if (smsOptIn === "yes") tags.push("SMS-OptIn");
+    if (parsed.items.some(i => i.serviceKey === "housewash")) tags.push("House-Wash");
+    if (parsed.housewashTier) tags.push(`House-Wash-Tier-${parsed.housewashTier}`);
 
     if (!email && !phone) {
       console.log("Skipping GHL upsert: no email/phone available from Stripe session/customer.");
@@ -407,20 +509,26 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
         email,
         phone,
         name,
-        tags,
+        tags: uniq(tags),
         custom: {
           r4_part_number: partNumber,
           r4_service_summary: serviceSummary,
           r4_monthly_amount: monthlyAmount,
+          r4_one_time_amount: oneTimeAmount,
+          r4_purchase_type: purchaseType,
+
           stripe_customer_id: customerId,
           stripe_subscription_id: subscriptionId,
           stripe_subscription_status: subscriptionId ? "active" : "n/a",
+
           r4_customer_phone: phone,
           r4_sms_opt_in: smsOptIn,
           r4_sms_opt_in_ts: smsOptInTs,
-          // Optional convenience fields:
-          r4_purchase_type: purchaseType,
-          r4_one_time_amount: oneTimeAmount,
+
+          r4_service_keys: parsed.serviceKeysCsv,
+          r4_frequency_summary: parsed.frequenciesCsv,
+          r4_housewash_tier_key: parsed.housewashTier,
+          r4_housewash_tier_label: humanizeHousewashTier(parsed.housewashTier),
         },
       });
     }
@@ -429,10 +537,10 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
   if (type === "invoice.payment_succeeded") {
     const invoice = obj;
 
-    const customerId = invoice?.customer ? String(invoice.customer) : "";
-    const subscriptionId = invoice?.subscription ? String(invoice.subscription) : "";
+    const customerId = cleanString(invoice?.customer);
+    const subscriptionId = cleanString(invoice?.subscription);
 
-    const invoiceId = String(invoice?.id || "");
+    const invoiceId = cleanString(invoice?.id);
     const amountPaidCents = Number(invoice?.amount_paid ?? 0);
     const amountPaid = (amountPaidCents / 100).toFixed(2);
 
@@ -456,8 +564,8 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
   if (type === "customer.subscription.updated") {
     const sub = obj;
 
-    const customerId = sub?.customer ? String(sub.customer) : "";
-    const status = String(sub?.status || "");
+    const customerId = cleanString(sub?.customer);
+    const status = cleanString(sub?.status);
     const cancelAtPeriodEnd = Boolean(sub?.cancel_at_period_end);
 
     const currentPeriodEnd =
@@ -476,7 +584,7 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
 
   if (type === "customer.subscription.deleted") {
     const sub = obj;
-    const customerId = sub?.customer ? String(sub.customer) : "";
+    const customerId = cleanString(sub?.customer);
 
     if (customerId) {
       await stripeUpdateCustomerMetadata(env.STRIPE_SECRET_KEY, customerId, {
@@ -492,7 +600,7 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
 }
 
 // =====================================================
-// GoHighLevel: Contacts Upsert (better error logging)
+// GoHighLevel
 // =====================================================
 async function ghlUpsertContact(
   env: Env,
@@ -545,7 +653,7 @@ async function ghlUpsertContact(
 }
 
 // =====================================================
-// Stripe helper: Get customer
+// Stripe helpers
 // =====================================================
 async function stripeGetCustomer(stripeSecretKey: string, customerId: string): Promise<any> {
   const res = await fetch(`https://api.stripe.com/v1/customers/${encodeURIComponent(customerId)}`, {
@@ -559,9 +667,6 @@ async function stripeGetCustomer(stripeSecretKey: string, customerId: string): P
   return j;
 }
 
-// =====================================================
-// Stripe: Update Customer metadata
-// =====================================================
 async function stripeUpdateCustomerMetadata(
   stripeSecretKey: string,
   customerId: string,
@@ -595,7 +700,7 @@ async function stripeUpdateCustomerMetadata(
 }
 
 // =====================================================
-// Stripe signature verification (v1 HMAC SHA256)
+// Stripe signature verification
 // =====================================================
 async function verifyStripeSignature(payload: string, sigHeader: string, secret: string): Promise<boolean> {
   const parts = sigHeader.split(",").map((p) => p.trim());
@@ -662,15 +767,15 @@ function json(obj: unknown, status: number, request: Request) {
   });
 }
 
-//=======================================================
-// Fetch Stripe Info and Place into Orientation Form
-//=======================================================
+// =====================================================
+// Fetch Stripe Info for Orientation Form
+// =====================================================
 async function handleGetCheckoutContact(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") return json({ error: "Method not allowed" }, 405, request);
   if (!env.STRIPE_SECRET_KEY) return json({ error: "Missing STRIPE_SECRET_KEY" }, 500, request);
 
   const url = new URL(request.url);
-  const sessionId = String(url.searchParams.get("session_id") || "").trim();
+  const sessionId = cleanString(url.searchParams.get("session_id"));
   if (!sessionId) return json({ error: "Missing session_id" }, 400, request);
 
   const stripeUrl =
@@ -688,22 +793,22 @@ async function handleGetCheckoutContact(request: Request, env: Env): Promise<Res
     return json({ error: "Stripe lookup failed", details: s }, 400, request);
   }
 
-  const email = String(s?.customer_details?.email || s?.customer_email || s?.customer?.email || "").trim();
-  const phone = String(s?.customer_details?.phone || s?.customer?.phone || "").trim();
-  const name = String(s?.customer_details?.name || s?.customer?.name || "").trim();
-
   const md = s?.metadata || {};
+
+  const email = cleanString(s?.customer_details?.email || s?.customer_email || s?.customer?.email);
+  const phone = cleanString(s?.customer_details?.phone || s?.customer?.phone || md?.selectorPhone);
+  const name = cleanString(s?.customer_details?.name || s?.customer?.name);
 
   return json(
     {
       email,
       phone,
       name,
-      purchaseType: String(md.purchaseType || ""),
-      partNumber: String(md.partNumber || ""),
-      serviceSummary: String(md.serviceSummary || ""),
-      monthlyAmount: String(md.monthlyAmount || ""),
-      oneTimeAmount: String(md.oneTimeAmount || ""),
+      purchaseType: cleanString(md.purchaseType),
+      partNumber: cleanString(md.partNumber),
+      serviceSummary: cleanString(md.serviceSummary),
+      monthlyAmount: cleanString(md.monthlyAmount),
+      oneTimeAmount: cleanString(md.oneTimeAmount),
     },
     200,
     request
